@@ -72,6 +72,7 @@ export class RabbitMQResilience {
             await RabbitMQ.setRetryQueue();
             await RabbitMQ.setDeadLetterQueue();
             await RabbitMQ.consume();
+            await RabbitMQ.retryPendingOutboxEvents(); // Retry pending events on startup
         }
 
     }

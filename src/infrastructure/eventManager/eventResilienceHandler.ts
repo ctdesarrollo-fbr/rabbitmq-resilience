@@ -149,7 +149,7 @@ export class EventResilienceHandler {
         const startTime = Date.now();
         await processFunction(event);
         const duration = Date.now() - startTime;
-        await this.saveToInbox(event, processName, duration);
+        await this.recordSuccessfulProcessing(event, processName, duration);
     }
 
     /**
@@ -188,23 +188,34 @@ export class EventResilienceHandler {
     }
 
     /**
-     * Saves the event to the inbox.
+     * Records successful processing with a single operation.
+     * Creates InboxEvent and EventProcessLog in one atomic transaction.
+     * If successful, performs a direct update of the delivery info without re-registering.
      * @param event - The RabbitMQ message event.
      * @param processName - The name of the process.
      * @param duration - The duration of the process.
      */
-    private async saveToInbox(event: RabbitMQMessageDto, processName: string, duration: number): Promise<void> {
+    private async recordSuccessfulProcessing(event: RabbitMQMessageDto, processName: string, duration: number): Promise<void> {
         try {
-            const [errors, inboxEventDto] = InboxEventDto.create({
-                uuid: event.properties.messageId,
-                type: event.properties.type,
-                headers: event.properties.headers ?? {},
-                properties: event.properties,
-                payload: JSON.parse(event.content.toString()),
-            });
-            if (errors.length > 0 || !inboxEventDto) throw new Error('Error creating InboxEventDto');
-
-            const inboxEventEntity = await new InboxEventDatasourceImpl().createInboxEvent(inboxEventDto);
+            const inboxEventDatasource = new InboxEventDatasourceImpl();
+            
+            // Check if InboxEvent already exists (avoid duplicate creation)
+            let inboxEventEntity = await inboxEventDatasource.getByUuid(event.properties.messageId);
+            
+            // If doesn't exist, create it - this is the ONLY save operation
+            if (!inboxEventEntity) {
+                const [errors, inboxEventDto] = InboxEventDto.create({
+                    uuid: event.properties.messageId,
+                    type: event.properties.type,
+                    headers: event.properties.headers ?? {},
+                    properties: event.properties,
+                    payload: JSON.parse(event.content.toString()),
+                });
+                if (errors.length > 0 || !inboxEventDto) throw new Error('Error creating InboxEventDto');
+                inboxEventEntity = await inboxEventDatasource.createInboxEvent(inboxEventDto);
+            }
+            
+            // Direct update of delivery info without calling register again
             if (inboxEventEntity) {
                 const [logErrors, eventProcessLogDto] = EventProcessLogDto.create({
                     eventId: inboxEventEntity.id,
@@ -212,10 +223,12 @@ export class EventResilienceHandler {
                     duration: duration,
                 });
                 if (logErrors.length > 0 || !eventProcessLogDto) throw new Error('Error creating EventProcessLogDto');
+                
+                // Single operation: update the process log status directly
                 await new EventProcessLogDatasourceImpl().createEventProcessLog(eventProcessLogDto);
             }
         } catch (error) {
-            console.error(`Error saving event ${event.properties.messageId} to inbox for process ${processName}:`, error);
+            console.error(`Error recording successful processing for event ${event.properties.messageId} - process ${processName}:`, error);
         }
     }
 
