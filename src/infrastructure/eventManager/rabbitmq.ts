@@ -1,14 +1,15 @@
-import {Channel, connect, Connection} from 'amqplib';
-import {assertExchange, assertQueue} from './config';
-import {RabbitMQMessageDto} from "@/domain/dtos/eventManager";
-import {EventException} from "@/infrastructure/eventManager/eventException";
-import {QueueStatus} from "@/domain/entities/eventManager/rabbitMQInfo.entity";
-import {RabbitMQResilienceSocketManager} from "@/infrastructure/socket/rabbitMQResilienceSocketManager";
+import { Channel, connect, Connection } from 'amqplib';
+import { assertExchange, assertQueue } from './config';
+import { RabbitMQMessageDto } from "@/domain/dtos/eventManager";
+import { EventException } from "@/infrastructure/eventManager/eventException";
+import { QueueStatus } from "@/domain/entities/eventManager/rabbitMQInfo.entity";
+import { RabbitMQResilienceSocketManager } from "@/infrastructure/socket/rabbitMQResilienceSocketManager";
 import signature from "@/infrastructure/socket/signatures";
-import {EventStatus} from "@/infrastructure/eventManager/eventResilienceHandler";
-import {RabbitMQResilienceConfig} from "@/domain/interfaces/rabbitMQResilienceConfig";
-import {DeliveryInfo} from "@/domain/interfaces/outboxEvent";
-import {InboxEventDatasourceImpl, OutboxEventDatasourceImpl} from "@/infrastructure/datasources/eventManager";
+import { EventStatus } from "@/infrastructure/eventManager/eventResilienceHandler";
+import { RabbitMQResilienceConfig } from "@/domain/interfaces/rabbitMQResilienceConfig";
+import { DeliveryInfo } from "@/domain/interfaces/outboxEvent";
+import { InboxEventDatasourceImpl, OutboxEventDatasourceImpl } from "@/infrastructure/datasources/eventManager";
+import { OutboxEventSequelize } from "@/infrastructure/database/models/eventManager/OutboxEvent";
 import { Logs } from '@/infrastructure/utils/logs';
 import { EmailConfigInterface } from '@/domain/interfaces/emailConfig';
 
@@ -23,6 +24,8 @@ export class RabbitMQ {
     private static _config: RabbitMQResilienceConfig
     private static _eventList: Map<string, (rabbitMQMessageDto: RabbitMQMessageDto) => Promise<void>>;
     private static _emailConfig: EmailConfigInterface;
+    private static _isReconnecting = false;
+    private static readonly MAX_RECONNECT_DELAY = 60000; // 60 segundos máximo
 
     public static set config(value: RabbitMQResilienceConfig) {
         this._config = value;
@@ -45,8 +48,11 @@ export class RabbitMQ {
             this._connection = await connect(this._config.rabbitMQConfigConnect)
             this._channel = await this._connection.createConfirmChannel()
             this.handle()
-        } catch (e) {
-            Logs.error("RabbitMQResilience: ",e)
+        } catch (e: any) {
+            const errorMsg = e?.code === 'ENOTFOUND'
+                ? `No se pudo conectar a RabbitMQ en ${e.hostname}`
+                : `Error al conectar a RabbitMQ: ${e?.message || 'Error desconocido'}`;
+            Logs.error(`RabbitMQResilience: ${errorMsg}`);
             this.reconnect();
         }
     }
@@ -70,25 +76,35 @@ export class RabbitMQ {
             this._connection.close();
         });
     }
-    
+
     private static async reconnect(delay = 5000) {
+        if (this._isReconnecting) {
+            return; // Evitar múltiples reconexiones simultáneas
+        }
+
         this._isConsuming = false;
-        
+        this._isReconnecting = true;
+
         setTimeout(async () => {
             try {
                 await this.connection();
-    
+
                 if (this._channel && this._connection) {
-                    Logs.info("RabbitMQResilience: Connection established. Trying to consume...");
+                    Logs.info("RabbitMQResilience: Conexión establecida");
                     await this.consume();
-                    Logs.info("RabbitMQResilience: Reconnected successfully.");
+                    await this.retryPendingOutboxEvents(); // Retry pending events after reconnection
+                    Logs.info("RabbitMQResilience: Reconectado exitosamente");
+                    this._isReconnecting = false;
                 } else {
                     throw new Error("Connection or channel not available after reconnection.");
                 }
-    
-            } catch (err) {
-                Logs.error("RabbitMQResilience: Reconnection failed:", err);
-                this.reconnect(delay * 2);
+
+            } catch (err: any) {
+                // Limitar el delay máximo a 60 segundos
+                const nextDelay = Math.min(delay * 2, this.MAX_RECONNECT_DELAY);
+                Logs.error(`RabbitMQResilience: Reintentando en ${nextDelay / 1000}s...`);
+                this._isReconnecting = false;
+                this.reconnect(nextDelay);
             }
         }, delay);
     }
@@ -198,30 +214,32 @@ export class RabbitMQ {
             this._config.queue,
             (msg) => {
                 (async () => {
+                    const [error, eventDto] = RabbitMQMessageDto.create(msg!);
+                    const eventType = eventDto?.properties.type || 'unknown';
+                    
                     try {
-                        const [error, eventDto] = RabbitMQMessageDto.create(msg!);
-                        Logs.time(eventDto?.properties.type);
-
                         if (error.length > 0 || !eventDto) {
                             // Publish to dead letter queue
                             Logs.error(`RabbitMQResilience: Error creating RabbitMQMessageDto: ${error.join(', ')}`);
                             await this.sendToDeadLetterQueueOnError(msg!, error);
-                            this._channel.ack(msg!);
                             return;
-                        } else {
-                            const headers = eventDto.properties.headers;
-                            if (headers?.redelivery_count && headers.retry_endpoint !== this._config.retryEndpoint) {
-                                Logs.info(`RabbitMQResilience: Message ${eventDto.properties.messageId} has redelivery_count and retry_endpoint is different. Acknowledging without processing.`);
-                                this._channel.ack(msg!);
-                                return;
-                            }
-                            await this.messageHandler(eventDto);
                         }
-                        Logs.timeEnd(eventDto.properties.type);
+                        
+                        const headers = eventDto.properties.headers;
+                        if (headers?.redelivery_count && headers.retry_endpoint !== this._config.retryEndpoint) {
+                            Logs.warn(`RabbitMQResilience: Message ${eventDto.properties.messageId} has redelivery_count and retry_endpoint is different (${headers.retry_endpoint} vs ${this._config.retryEndpoint}). Sending to DLQ.`);
+                            await this.publishToDeadLetterQueue(eventDto, null);
+                            return;
+                        }
+                        
+                        Logs.time(`${eventType}-${eventDto.properties.messageId}`);
+                        await this.messageHandler(eventDto);
+                        Logs.timeEnd(`${eventType}-${eventDto.properties.messageId}`);
                     } catch (error) {
                         Logs.error(error as string);
+                    } finally {
+                        this._channel.ack(msg!);
                     }
-                    this._channel.ack(msg!);
                 })();
             }
         )
@@ -240,8 +258,7 @@ export class RabbitMQ {
         if (eventProcessor) {
             await eventProcessor(msg);
         } else {
-            Logs.info("RabbitMQResilience: Event not found:" + msg.properties.type);
-
+            // Event not found - silently discard
             if (RabbitMQResilienceSocketManager.getSocket()) {
                 RabbitMQResilienceSocketManager.emit(signature.DISCARD_MESSAGE.abbr,
                     {
@@ -420,21 +437,67 @@ export class RabbitMQ {
         await this.setRetryQueue()
         await this.setDeadLetterQueue()
         await this.consume()
-        //await this.fakeConsume()
+        await this.retryPendingOutboxEvents() // Retry pending events on startup
     }
 
     public static async publishMessage(event: RabbitMQMessageDto, exchange?: string, routingKey?: string): Promise<void> {
+        // STEP 1: ALWAYS save to outbox first
+        await new OutboxEventDatasourceImpl().registerFromRabbitMQMessageDto(event, null);
+
+        // STEP 2: Try to publish if channel exists
         if (this._channel) {
-            if (exchange && routingKey) {
-                await this.publishToExchangeWithConfirmation(event, exchange, routingKey);
-            } else {
-                const defaultExchange = this._config.exchange;
-                const defaultRoutingKey = this._config.routingKey;
-                await this.publishToExchangeWithConfirmation(event, defaultExchange, defaultRoutingKey);
-            }
+            await this.tryPublishToExchange(event, exchange, routingKey);
         } else {
-            Logs.error("RabbitMQResilience: Channel not found");
+            Logs.warn(`RabbitMQResilience: No channel available, event ${event.properties.messageId} saved in outbox for retry`);
         }
+    }
+
+    private static async tryPublishToExchange(event: RabbitMQMessageDto, exchange?: string, routingKey?: string): Promise<void> {
+        try {
+            const targetExchange = exchange || this._config.exchange;
+            const targetRoutingKey = routingKey || this._config.routingKey;
+
+            const result = this._channel.publish(
+                targetExchange,
+                targetRoutingKey,
+                event.content,
+                {
+                    headers: event.properties.headers,
+                    appId: event.properties.appId,
+                    messageId: event.properties.messageId,
+                    type: event.properties.type,
+                    contentType: event.properties.contentType,
+                    persistent: true
+                }
+            );
+
+            if (result) {
+                await this.updateOutboxWithDeliveryInfo(event, 'exchange', targetExchange, targetRoutingKey);
+                Logs.info(`RabbitMQResilience: Published event ${event.properties.messageId} to exchange ${targetExchange}`);
+            } else {
+                Logs.warn(`RabbitMQResilience: Failed to publish event ${event.properties.messageId}, will remain pending`);
+            }
+        } catch (error: any) {
+            Logs.error(`RabbitMQResilience: Error publishing event ${event.properties.messageId}: ${error?.message || 'Unknown error'}`);
+        }
+    }
+
+    private static async updateOutboxWithDeliveryInfo(
+        event: RabbitMQMessageDto,
+        destinationType: 'exchange' | 'queue',
+        destinationName: string,
+        routingKey?: string
+    ): Promise<void> {
+        const deliveryInfo: DeliveryInfo = {
+            timestamp: new Date(),
+            host: this.getHost(),
+            virtualHost: this.getVirtualHost(),
+            destinationType,
+            destinationName,
+            ...(routingKey && { routingKey })
+        };
+
+        await new OutboxEventDatasourceImpl().updateDeliveryInfo(event.properties.messageId, deliveryInfo);
     }
 
     public static async publishToQueueWithConfirmation(queue: string, event: RabbitMQMessageDto) {
@@ -518,6 +581,12 @@ export class RabbitMQ {
 
         const [error, eventDto] = RabbitMQMessageDto.create({
             content: Buffer.from(JSON.stringify(outboxEvent.payload)),
+            fields: {
+                delivery_tag: 0,
+                redelivered: false,
+                exchange: this._config.exchange,
+                routing_key: this._config.routingKey
+            },
             properties: outboxEvent.properties,
         });
 
@@ -545,7 +614,12 @@ export class RabbitMQ {
         // Transform inbox event to RabbitMQMessageDto
         const [error, eventDto] = RabbitMQMessageDto.create({
             content: Buffer.from(JSON.stringify(inboxEvent.payload)),
-            fields: inboxEvent.headers,
+            fields: {
+                delivery_tag: 0,
+                redelivered: false,
+                exchange: this._config.exchange,
+                routing_key: this._config.routingKey
+            },
             properties: inboxEvent.properties,
         });
         if (error.length > 0 || !eventDto) {
@@ -574,5 +648,77 @@ export class RabbitMQ {
 
     public static getIsConsuming() {
         return this._isConsuming;
+    }
+
+    /**
+     * Retries all pending outbox events (events with deliveryInfo = null)
+     * This function is called on startup and after reconnection to publish events that accumulated while disconnected
+     * Processes events in batches to avoid memory overload
+     * @param {number} batchSize - Number of events to process per batch (default: 100)
+     */
+    public static async retryPendingOutboxEvents(batchSize: number = 100): Promise<void> {
+        if (!this._channel) {
+            Logs.warn('RabbitMQResilience: Cannot retry pending events, no channel available');
+            return;
+        }
+
+        try {
+            let totalProcessed = 0;
+            let hasMore = true;
+
+            while (hasMore) {
+                // Get pending events from outbox
+                const pendingEvents = await OutboxEventSequelize.findAll({
+                    where: {
+                        deliveryInfo: null
+                    },
+                    limit: batchSize,
+                    order: [['createdAt', 'ASC']] // Oldest first
+                });
+
+                if (pendingEvents.length === 0) {
+                    hasMore = false;
+                    break;
+                }
+
+                Logs.info(`RabbitMQResilience: Processing batch of ${pendingEvents.length} pending outbox events`);
+
+                for (const event of pendingEvents) {
+                    const [error, eventDto] = RabbitMQMessageDto.create({
+                        content: Buffer.from(JSON.stringify(event.payload)),
+                        fields: {
+                            delivery_tag: 0,
+                            redelivered: false,
+                            exchange: this._config.exchange,
+                            routing_key: this._config.routingKey
+                        },
+                        properties: event.properties,
+                    });
+
+                    if (error.length > 0 || !eventDto) {
+                        Logs.error(`RabbitMQResilience: Failed to create RabbitMQMessageDto for ${event.uuid}: ${error.join(', ')}`);
+                        continue;
+                    }
+
+                    // Use tryPublishToExchange instead of publishMessage to avoid double-saving to outbox
+                    await this.tryPublishToExchange(eventDto);
+                }
+
+                totalProcessed += pendingEvents.length;
+
+                // If we got fewer events than the batch size, there are no more pending events
+                if (pendingEvents.length < batchSize) {
+                    hasMore = false;
+                }
+            }
+
+            if (totalProcessed === 0) {
+                Logs.info('RabbitMQResilience: No pending outbox events to retry');
+            } else {
+                Logs.info(`RabbitMQResilience: Finished retrying ${totalProcessed} pending outbox events`);
+            }
+        } catch (error: any) {
+            Logs.error(`RabbitMQResilience: Error retrying pending outbox events: ${error?.message || 'Unknown error'}`);
+        }
     }
 }

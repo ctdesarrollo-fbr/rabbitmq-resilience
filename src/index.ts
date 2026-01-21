@@ -1,4 +1,4 @@
-export {RabbitMQMessageDto} from '@/domain/dtos/eventManager';
+export {RabbitMQMessageDto, MessageFieldsDto, MessagePropertiesDto} from '@/domain/dtos/eventManager';
 export {RabbitMQResilience} from '@/infrastructure/eventManager/rabbitMQResilience';
 export {RabbitMQResilienceRoutes} from '@/presentation/routes/routes';
 export {RabbitMQResilienceSocketManager} from '@/infrastructure/socket/rabbitMQResilienceSocketManager';

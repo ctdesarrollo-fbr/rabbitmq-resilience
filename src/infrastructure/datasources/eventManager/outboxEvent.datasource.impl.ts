@@ -48,7 +48,7 @@ export class OutboxEventDatasourceImpl implements OutboxEventDatasource {
                 properties: outboxEventDto.properties,
                 payload: outboxEventDto.payload,
                 deliveryInfo: outboxEventDto.deliveryInfo,
-                attempts: outboxEventDto.attempts
+                attempts: 1  // First attempt
             });
             return this.mapToEntity(outboxEvent);
         }
@@ -108,5 +108,10 @@ export class OutboxEventDatasourceImpl implements OutboxEventDatasource {
         return this.register(outboxEventDto!);
     }
 
-
+    async updateDeliveryInfo(uuid: string, deliveryInfo: DeliveryInfo): Promise<void> {
+        const existingEvent = await OutboxEventSequelize.findOne({ where: { uuid } });
+        if (existingEvent) {
+            await existingEvent.update({ deliveryInfo });
+        }
+    }
 }
