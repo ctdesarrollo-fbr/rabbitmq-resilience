@@ -8,7 +8,7 @@
 To install the package, use npm:
 
 ```bash
-npm install rabbitmq-resilience
+npm install @ctdesarrollo-pkgs/rabbitmq-resilience
 ```
 
 ## Configuration
